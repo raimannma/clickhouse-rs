@@ -159,6 +159,35 @@ impl Query {
         Ok(result)
     }
 
+    /// Executes a continuous (streaming) query, returning a [`RowCursor`] that
+    /// keeps emitting rows as new data is inserted.
+    ///
+    /// Write the `STREAM` modifier (and any `CURSOR` clause) in the SQL
+    /// yourself; the query is not rewritten. Enables `enable_streaming_queries`,
+    /// disables `max_execution_time`, and the cursor never completes on its own.
+    /// Experimental; requires a Linux server with streaming-query support.
+    pub fn stream<T: Row>(mut self) -> Result<RowCursor<T>> {
+        let validation = self.client.get_validation();
+        let format = if validation {
+            formats::ROW_BINARY_WITH_NAMES_AND_TYPES
+        } else {
+            formats::ROW_BINARY
+        };
+
+        let span = self.make_span(Some(format)).entered();
+
+        self.enable_streaming();
+        self.sql.bind_fields::<T>();
+
+        let response = self.do_execute(Some(format))?;
+        Ok(RowCursor::new(response, validation, span.exit()))
+    }
+
+    fn enable_streaming(&mut self) {
+        self.client.set_setting("enable_streaming_queries", "1");
+        self.client.set_setting("max_execution_time", "0");
+    }
+
     /// Executes the query, returning a [`BytesCursor`] to obtain results as raw
     /// bytes containing data in the [provided format].
     ///
@@ -325,5 +354,37 @@ impl Query {
         } else {
             self.with_setting(format!("param_{name}"), param)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Client;
+    use clickhouse_macros::Row;
+
+    #[allow(unused)]
+    #[derive(Row)]
+    #[clickhouse(crate = "crate")]
+    struct MyRow {
+        id: u64,
+        name: String,
+    }
+
+    #[test]
+    fn stream_enables_settings_and_preserves_sql() {
+        let mut query =
+            Client::default().query("SELECT ?fields FROM events STREAM CURSOR { id: 42 }");
+        query.enable_streaming();
+        query.sql.bind_fields::<MyRow>();
+
+        assert_eq!(
+            query.sql.to_string(),
+            "SELECT `id`,`name` FROM events STREAM CURSOR { id: 42 }"
+        );
+        assert_eq!(
+            query.client.get_setting("enable_streaming_queries"),
+            Some("1")
+        );
+        assert_eq!(query.client.get_setting("max_execution_time"), Some("0"));
     }
 }

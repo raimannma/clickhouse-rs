@@ -272,6 +272,7 @@ mod query_syntax;
 mod rbwnat_header;
 mod rbwnat_smoke;
 mod rbwnat_validation;
+mod stream;
 mod time;
 mod user_agent;
 mod uuid;

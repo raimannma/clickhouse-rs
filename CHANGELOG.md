@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+### Added
+- query: `Query::stream` for continuous queries using the experimental server-side `STREAM` modifier (written by the caller).
+
 ## [0.15.1] - 2026-06-01
 
 ### Added
