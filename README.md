@@ -297,9 +297,15 @@ The server sends data as columnar blocks. The client converts them to the format
 For `INSERT`, the client converts rows to blocks with the column types of the table.
 
 These items are different from the HTTP interface:
-* `Query::fetch_bytes()` supports only the `Native`, `RowBinary`, `RowBinaryWithNames` and
-  `RowBinaryWithNamesAndTypes` formats. The server does not format data for the native protocol.
-  Other formats return `Error::Unsupported`. Thus, `clickhouse-ext-arrow` cannot read data.
+* `Query::fetch_bytes()` supports the `Native`, `RowBinary`, `RowBinaryWithNames` and
+  `RowBinaryWithNamesAndTypes` formats, which the client converts from blocks, and the text formats
+  with one line per row: `JSONEachRow` (also `JSONLines`, `NDJSON`), `JSONStringsEachRow`,
+  `JSONCompactEachRow`, `JSONCompactStringsEachRow`, `CSV`, `TabSeparated` (`TSV`),
+  `TabSeparatedRaw` (`TSVRaw`, `Raw`) and `LineAsString`. For a text format, the client sends
+  `SELECT formatRow('<format>', *) FROM (<query>)`, so the server formats the rows with the settings of
+  the query, and only `SELECT`, `WITH` and `EXPLAIN` queries are supported. `output_format_json_array_of_rows = 1`
+  is not supported. Other formats (with a header or a footer, e.g. `CSVWithNames`, `JSON`, `Parquet`,
+  `ArrowStream`) return `Error::Unsupported`. Thus, `clickhouse-ext-arrow` cannot read data.
 * `InsertFormatted` streams data in the `RowBinary` formats and `Native`. For other formats, the client
   keeps all data in memory and sends it after the query text when `end()` is called (maximum 1 GiB).
 * Headers (`Client::with_header()`) and custom HTTP clients have no effect.

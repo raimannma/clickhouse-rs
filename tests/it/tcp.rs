@@ -323,13 +323,30 @@ async fn fetch_bytes(client: &Client, case: &Case, format: &str) -> Result<Vec<u
     Ok(query.fetch_bytes(format)?.collect().await?.to_vec())
 }
 
+/// The text formats that the server formats with `formatRow()` for the native transport.
+const TEXT_FORMATS: &[&str] = &[
+    "JSONEachRow",
+    "JSONStringsEachRow",
+    "JSONCompactEachRow",
+    "JSONCompactStringsEachRow",
+    "CSV",
+    "TabSeparated",
+    "TabSeparatedRaw",
+    "LineAsString",
+];
+
 /// Compare the responses of both transports for every query and format.
 async fn compare_corpus(tcp: &Client) {
+    compare_corpus_in(tcp, FORMATS).await;
+}
+
+/// Compare the responses of both transports for every query in each of `formats`.
+async fn compare_corpus_in(tcp: &Client, formats: &[&str]) {
     let http = http_client();
     let mut compared = 0;
 
     for case in CORPUS {
-        for &format in FORMATS {
+        for &format in formats {
             let expected = fetch_bytes(&http, case, format).await;
             let actual = fetch_bytes(tcp, case, format).await;
 
@@ -364,7 +381,8 @@ async fn compare_corpus(tcp: &Client) {
     }
 
     // Older servers do not support some types; most cases must be supported by any version.
-    let total = CORPUS.len() * FORMATS.len();
+    // `LineAsString` supports only a single `String` column.
+    let total = CORPUS.len() * formats.iter().filter(|f| **f != "LineAsString").count();
     assert!(
         compared * 10 >= total * 7,
         "only {compared} of {total} responses compared"
@@ -389,6 +407,145 @@ async fn corpus_matches_http_lz4() {
 async fn corpus_matches_http_zstd() {
     check_local_env!();
     compare_corpus(&tcp_client().with_compression(Compression::zstd())).await;
+}
+
+#[tokio::test]
+async fn text_corpus_matches_http() {
+    check_local_env!();
+    compare_corpus_in(&tcp_client(), TEXT_FORMATS).await;
+}
+
+/// Queries that the native transport rewrites for text formats give the same response as HTTP.
+#[tokio::test]
+async fn text_formats_match_http() {
+    check_local_env!();
+
+    const QUOTE_64BIT: &[(&str, &str)] = &[("output_format_json_quote_64bit_integers", "1")];
+    const MANY_BLOCKS: &[(&str, &str)] = &[("max_block_size", "1000"), ("max_threads", "8")];
+    let cases = [
+        case(
+            "format_clause",
+            "SELECT number, toString(number) AS s FROM numbers(5) FORMAT JSONEachRow;",
+        ),
+        case("semicolon", "SELECT number FROM numbers(3) ;\n"),
+        case(
+            "settings_clause",
+            "SELECT number FROM numbers(10) ORDER BY number DESC LIMIT 5 SETTINGS max_threads = 1",
+        ),
+        case(
+            "trailing_comment",
+            "SELECT number FROM numbers(3) -- comment",
+        ),
+        case(
+            "with",
+            "WITH t AS (SELECT number AS n FROM numbers(3)) SELECT n, n * 2 AS d FROM t ORDER BY n",
+        ),
+        case("empty", "SELECT number FROM numbers(10) WHERE number > 100"),
+        case(
+            "big_integers",
+            "SELECT toUInt64(18446744073709551615) AS u, toInt128(-1) AS i, 1.5::Float32 AS f",
+        ),
+        case_with(
+            "quote_64bit",
+            "SELECT toUInt64(18446744073709551615) AS u",
+            QUOTE_64BIT,
+        ),
+        case(
+            "escaping",
+            "SELECT unhex('FF00') AS bytes, 'a\"b,c\\td\ne' AS s, NULL AS n, [1, 2] AS a, (1, 'x') AS t",
+        ),
+        case(
+            "dates",
+            "SELECT toDate('2024-01-02') AS d, toDateTime64('2024-01-02 03:04:05.678', 3, 'UTC') AS t",
+        ),
+        case_with(
+            "order_over_blocks",
+            "SELECT number FROM numbers(100000) ORDER BY number % 1000, number DESC",
+            MANY_BLOCKS,
+        ),
+        case("explain", "EXPLAIN SELECT 1"),
+    ];
+
+    let http = http_client();
+    let tcp = tcp_client();
+
+    for case in &cases {
+        for &format in TEXT_FORMATS {
+            let expected = fetch_bytes(&http, case, format).await;
+            let actual = fetch_bytes(&tcp, case, format).await;
+
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => assert!(
+                    expected == actual,
+                    "{} ({format}): responses differ\nHTTP: {:?}\nTCP:  {:?}",
+                    case.name,
+                    String::from_utf8_lossy(&expected[..expected.len().min(300)]),
+                    String::from_utf8_lossy(&actual[..actual.len().min(300)]),
+                ),
+                (Err(_), Err(_)) => {}
+                (Err(e), Ok(_)) => panic!("{} ({format}): only HTTP failed: {e}", case.name),
+                (Ok(_), Err(e)) => panic!("{} ({format}): only TCP failed: {e}", case.name),
+            }
+        }
+    }
+
+    // Server-side parameters are part of the subquery.
+    for client in [&http, &tcp] {
+        let lines = client
+            .query("SELECT {n:UInt64} AS n, {s:String} AS s")
+            .param("n", 42)
+            .param("s", "it's")
+            .fetch_bytes("JSONEachRow")
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(&lines[..], b"{\"n\":42,\"s\":\"it's\"}\n");
+    }
+}
+
+/// Text formats that `formatRow()` cannot produce are rejected before the query runs.
+#[tokio::test]
+async fn unsupported_text_formats() {
+    check_local_env!();
+    let tcp = tcp_client();
+
+    for format in ["JSONEachRow", "JSONStringsEachRow"] {
+        let result = tcp
+            .query("SELECT 1")
+            .with_setting("output_format_json_array_of_rows", "1")
+            .fetch_bytes(format);
+        assert!(matches!(result, Err(Error::Unsupported(_))), "{format}");
+    }
+
+    // The compact formats have no array of rows.
+    let lines = tcp
+        .query("SELECT 1 AS a")
+        .with_setting("output_format_json_array_of_rows", "1")
+        .fetch_bytes("JSONCompactEachRow")
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(&lines[..], b"[1]\n");
+
+    for format in [
+        "CSVWithNames",
+        "TSVWithNamesAndTypes",
+        "JSON",
+        "JSONCompact",
+        "Parquet",
+        "ArrowStream",
+    ] {
+        let result = tcp.query("SELECT 1").fetch_bytes(format);
+        assert!(matches!(result, Err(Error::Unsupported(_))), "{format}");
+    }
+
+    // Statements that cannot be a subquery.
+    for sql in ["SHOW TABLES", "DESCRIBE system.one", "EXISTS system.one"] {
+        let result = tcp.query(sql).fetch_bytes("TSV");
+        assert!(matches!(result, Err(Error::Unsupported(_))), "{sql}");
+    }
 }
 
 /// `JSON` is returned as strings by both transports with `output_format_binary_write_json_as_string`.
@@ -1013,7 +1170,7 @@ async fn connection_errors() {
     let result = Client::default()
         .with_url("tcp://127.0.0.1:1")
         .query("SELECT 1")
-        .fetch_bytes("CSV");
+        .fetch_bytes("Parquet");
     assert!(
         matches!(result, Err(Error::Unsupported(_))),
         "unexpected result"

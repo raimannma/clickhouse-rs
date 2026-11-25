@@ -4,7 +4,6 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 #[tokio::test]
 async fn single_chunk() {
-    skip_if_tcp!("the native protocol returns data only in the Native and RowBinary formats");
     let client = prepare_database!();
 
     let mut cursor = client
@@ -26,7 +25,6 @@ async fn single_chunk() {
 
 #[tokio::test]
 async fn multiple_chunks() {
-    skip_if_tcp!("the native protocol returns data only in the Native and RowBinary formats");
     let client = prepare_database!();
 
     let mut cursor = client
@@ -50,7 +48,6 @@ async fn multiple_chunks() {
 
 #[tokio::test]
 async fn error() {
-    skip_if_tcp!("the native protocol returns data only in the Native and RowBinary formats");
     let client = prepare_database!();
 
     let mut bytes_cursor = client
@@ -67,7 +64,6 @@ async fn error() {
 
 #[tokio::test]
 async fn lines() {
-    skip_if_tcp!("the native protocol returns data only in the Native and RowBinary formats");
     let client = prepare_database!();
     let expected = ["0", "1", "2"];
 
@@ -92,7 +88,6 @@ async fn lines() {
 
 #[tokio::test]
 async fn collect() {
-    skip_if_tcp!("the native protocol returns data only in the Native and RowBinary formats");
     let client = prepare_database!();
     let expected = b"0\n1\n2\n3\n";
 
@@ -115,7 +110,6 @@ async fn collect() {
 
 #[tokio::test]
 async fn async_read() {
-    skip_if_tcp!("the native protocol returns data only in the Native and RowBinary formats");
     let client = prepare_database!();
     let limit = 1000;
 

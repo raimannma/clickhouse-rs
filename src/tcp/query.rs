@@ -11,7 +11,10 @@ use crate::tcp::connection::{
 use crate::tcp::pool::{Pool, PooledConnection};
 use crate::tcp::profile_events::ProfileEvents;
 use crate::tcp::protocol::ClientInfo;
-use crate::tcp::{Request, RowFormat, changes_session, leading_words, params, trailing_format};
+use crate::tcp::{
+    Request, RowFormat, changes_session, leading_words, params, skip_whitespace_and_comments,
+    trailing_format,
+};
 use crate::{Client, Compression};
 use bytes::BytesMut;
 use std::borrow::Cow;
@@ -37,7 +40,33 @@ pub(crate) enum Output {
         types: bool,
     },
     Native,
+    /// A text format with one line per row, formatted by the server with `formatRow()`
+    /// (see [`format_rows_query()`]).
+    Text(&'static str),
 }
+
+/// The text formats with one line per row and no header or footer.
+///
+/// The server formats the rows with `formatRow()`, which gives the same lines as the format.
+const TEXT_FORMATS: &[&str] = &[
+    "JSONEachRow",
+    "JSONLines",
+    "NDJSON",
+    "JSONStringsEachRow",
+    "JSONCompactEachRow",
+    "JSONCompactStringsEachRow",
+    "CSV",
+    "TabSeparated",
+    "TSV",
+    "TabSeparatedRaw",
+    "TSVRaw",
+    "Raw",
+    "LineAsString",
+];
+
+/// The text formats that `output_format_json_array_of_rows = 1` changes: the rows are written
+/// as a JSON array, with `[`, `]` and commas that `formatRow()` does not write.
+const JSON_ARRAY_FORMATS: &[&str] = &["JSONEachRow", "JSONLines", "NDJSON", "JSONStringsEachRow"];
 
 impl Output {
     pub(crate) fn new(format: Option<&str>, sql: &str) -> Result<Self> {
@@ -51,11 +80,15 @@ impl Output {
         match RowFormat::from_name(name) {
             Some(RowFormat::RowBinary { names, types }) => Ok(Self::RowBinary { names, types }),
             Some(RowFormat::Native) => Ok(Self::Native),
-            None => Err(Error::Unsupported(format!(
-                "format {name} is not supported by the native TCP transport; \
-                 supported formats: Native, RowBinary, RowBinaryWithNames, \
-                 RowBinaryWithNamesAndTypes"
-            ))),
+            None => match TEXT_FORMATS.iter().find(|text| **text == name) {
+                Some(text) => Ok(Self::Text(text)),
+                None => Err(Error::Unsupported(format!(
+                    "format {name} is not supported by the native TCP transport; \
+                     supported formats: Native, RowBinary, RowBinaryWithNames, \
+                     RowBinaryWithNamesAndTypes, {}",
+                    TEXT_FORMATS.join(", ")
+                ))),
+            },
         }
     }
 
@@ -83,6 +116,18 @@ impl Output {
         match self {
             Self::Discard => Ok(()),
             Self::RowBinary { .. } => to_row_binary::write_rows(block, out),
+            Self::Text(_) => {
+                // Each value of `formatRow()` is one row with its line break.
+                let lines = match block.columns() {
+                    [column] => column.string_data(),
+                    _ => None,
+                };
+                let lines = lines.ok_or_else(|| {
+                    Error::BadResponse("expected one String column of formatted rows".into())
+                })?;
+                out.extend_from_slice(lines);
+                Ok(())
+            }
             Self::Native => block_encoder::write_block(
                 block,
                 WireFormat {
@@ -99,6 +144,31 @@ impl Output {
 pub(crate) fn query(client: &Client, sql: String, format: Option<&str>) -> Result<Response> {
     let output = Output::new(format, &sql)?;
     let mut request = Request::new(client)?;
+
+    let sql = match output {
+        Output::Text(format) => {
+            if JSON_ARRAY_FORMATS.contains(&format)
+                && request
+                    .setting("output_format_json_array_of_rows")
+                    .is_some_and(|value| value == "1")
+            {
+                return Err(Error::Unsupported(format!(
+                    "format {format} with output_format_json_array_of_rows = 1 is not supported \
+                     by the native TCP transport"
+                )));
+            }
+
+            if !is_subquery(sql.as_bytes()) {
+                return Err(Error::Unsupported(format!(
+                    "format {format} is supported by the native TCP transport only for \
+                     SELECT, WITH and EXPLAIN queries"
+                )));
+            }
+
+            format_rows_query(format, &sql)
+        }
+        _ => sql,
+    };
 
     if matches!(output, Output::RowBinary { .. })
         && request
@@ -127,6 +197,49 @@ pub(crate) fn query(client: &Client, sql: String, format: Option<&str>) -> Resul
         let (receiver, summary) = started.await?;
         Ok((Chunks::from_receiver(receiver, final_summary_rx), summary))
     })))
+}
+
+/// The query that returns the rows of `sql` in a text `format`, one `String` value per row.
+///
+/// The server formats the rows with its own code and the settings of the query, as it does for
+/// the HTTP interface. A trailing `FORMAT` clause and `;` are removed; a trailing `SETTINGS`
+/// clause stays valid in the subquery. The line breaks around the subquery end a trailing
+/// `--` comment. With only `LowCardinality` columns, `formatRow()` returns
+/// `LowCardinality(String)`, hence the `CAST`.
+fn format_rows_query(format: &str, sql: &str) -> String {
+    format!(
+        "SELECT CAST(formatRow('{format}', *) AS String) FROM (\n{}\n)",
+        strip_format_clause(sql)
+    )
+}
+
+/// Returns `true` if the statement can be a subquery: `SELECT`, `WITH`, `EXPLAIN` or a
+/// statement in parentheses. `SHOW`, `DESCRIBE`, `EXISTS` and others cannot.
+fn is_subquery(sql: &[u8]) -> bool {
+    if skip_whitespace_and_comments(sql).starts_with(b"(") {
+        return true;
+    }
+
+    leading_words(sql, 1).first().is_some_and(|word| {
+        [&b"SELECT"[..], b"WITH", b"EXPLAIN"]
+            .iter()
+            .any(|keyword| word.eq_ignore_ascii_case(keyword))
+    })
+}
+
+/// The SQL without a trailing `FORMAT <name>` clause and `;`.
+fn strip_format_clause(sql: &str) -> &str {
+    let sql = sql.trim_end().trim_end_matches(';').trim_end();
+
+    let Some(rest) = trailing_format(sql).and_then(|name| sql.strip_suffix(name)) else {
+        return sql;
+    };
+
+    // `trailing_format()` checked that the keyword before the name is `FORMAT`.
+    let rest = rest.trim_end();
+    rest.get(..rest.len().saturating_sub("FORMAT".len()))
+        .unwrap_or(rest)
+        .trim_end()
 }
 
 /// The blocks of a query result, once the query has started.
@@ -796,4 +909,82 @@ async fn cancel(pooled: &mut PooledConnection, compression: Compression) -> bool
         tokio::time::timeout(CANCEL_TIMEOUT, finished).await,
         Ok(Some(()))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_formats() {
+        assert_eq!(
+            Output::new(Some("JSONEachRow"), "SELECT 1").ok(),
+            Some(Output::Text("JSONEachRow"))
+        );
+        // A `FORMAT` clause overrides the default format.
+        assert_eq!(
+            Output::new(Some("RowBinary"), "SELECT 1 FORMAT CSV").ok(),
+            Some(Output::Text("CSV"))
+        );
+
+        for format in ["CSVWithNames", "JSON", "Parquet", "Arrow", "jsoneachrow"] {
+            assert!(
+                matches!(
+                    Output::new(Some(format), "SELECT 1"),
+                    Err(Error::Unsupported(_))
+                ),
+                "{format}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_format_clause() {
+        assert_eq!(strip_format_clause("SELECT 1"), "SELECT 1");
+        assert_eq!(strip_format_clause("SELECT 1;\n"), "SELECT 1");
+        assert_eq!(
+            strip_format_clause("SELECT 1 FORMAT JSONEachRow"),
+            "SELECT 1"
+        );
+        assert_eq!(strip_format_clause("select 1\nformat CSV ;"), "select 1");
+        assert_eq!(strip_format_clause("SELECT (1)FORMAT TSV"), "SELECT (1)");
+        assert_eq!(
+            strip_format_clause("SELECT 1 SETTINGS max_threads = 1"),
+            "SELECT 1 SETTINGS max_threads = 1"
+        );
+        assert_eq!(
+            strip_format_clause("SELECT 'FORMAT x'"),
+            "SELECT 'FORMAT x'"
+        );
+    }
+
+    #[test]
+    fn wraps_query() {
+        assert_eq!(
+            format_rows_query("CSV", "SELECT 1 -- comment\nFORMAT TSV;"),
+            "SELECT CAST(formatRow('CSV', *) AS String) FROM (\nSELECT 1 -- comment\n)"
+        );
+    }
+
+    #[test]
+    fn subqueries() {
+        for sql in [
+            "SELECT 1",
+            "  with t AS (SELECT 1) SELECT * FROM t",
+            "-- comment\nEXPLAIN SELECT 1",
+            "/* comment */ (SELECT 1)",
+        ] {
+            assert!(is_subquery(sql.as_bytes()), "{sql}");
+        }
+
+        for sql in [
+            "SHOW TABLES",
+            "DESCRIBE t",
+            "EXISTS t",
+            "INSERT INTO t SELECT 1",
+            "",
+        ] {
+            assert!(!is_subquery(sql.as_bytes()), "{sql}");
+        }
+    }
 }

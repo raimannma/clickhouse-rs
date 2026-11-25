@@ -225,6 +225,19 @@ impl Column {
         }
     }
 
+    /// The values of a `String` column without `NULL` values, one after another.
+    ///
+    /// The values are raw bytes: they can be invalid UTF-8.
+    #[cfg(feature = "tcp")]
+    pub(crate) fn string_data(&self) -> Option<&[u8]> {
+        match (&self.data_type, &self.layout.kind, &self.layout.nulls) {
+            (DataTypeNode::String, LayoutKind::Variable { end_offsets, data }, None) => {
+                data.get(..end_offsets.last().copied().unwrap_or(0))
+            }
+            _ => None,
+        }
+    }
+
     /// The data type as the server wrote it, or as [`DataTypeNode`] formats it.
     pub(crate) fn type_name(&self) -> Cow<'_, [u8]> {
         match &self.type_name {
